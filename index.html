@@ -73,6 +73,7 @@ button{background:none;border:0;cursor:pointer}
 .foe__hp{font-family:var(--f-num);font-size:23px;white-space:nowrap;color:var(--ohra)}
 .boss .foe__hp{color:var(--kinovar-lite)}
 .foe__sub{font-size:13px;color:var(--kost-dim);margin:9px 0 0}
+.foe__rest{font-size:13px;color:var(--kost-mute);margin:7px 0 0}
 
 /* один смелый элемент: полоса с рваным тлеющим краем */
 .hp{position:relative;height:20px;background:var(--dym2);border:1px solid var(--pepel);border-radius:2px;overflow:hidden}
@@ -329,9 +330,14 @@ var BALANCE = {
   comboCap:       2.0,
   elements:     { sleep:0.15, food:0.10, move:0.10, rest:0.10 },
   clarity:        0.15,
-  enemy: { hpDefault:120, hpMin:80, hpMax:400, medianFactor:0.8, medianDays:7, medianMinDays:3,
-           lootChance:0.15, killXpFactor:0.1 },
-  boss:  { powerDays:7, powerFactor:3, cooldownDays:5, windowHours:24,
+  /* norm — норма дня в единицах урона, от неё считается всё остальное.
+     def — пока данных меньше medianMinDays; back — возвращение после паузы (окно пусто,
+     но история есть); min/max — рельсы против мусорных данных, не игровой потолок.
+     squad — доли нормы дня на каждого из отряда: 0.33 + 0.5 + 0.67 = полторы нормы. */
+  enemy: { norm:{ def:350, back:120, min:60, max:20000 },
+           squad:[0.33, 0.5, 0.67],
+           medianDays:7, medianMinDays:3, lootChance:0.15, killXpFactor:0.1 },
+  boss:  { powerDays:7, powerFactor:2.4, cooldownDays:5, windowHours:24,
            multStart:1.6, multWin:0.1, multMax:2.2, multLose:0.15, multMin:1.1, killXpFactor:0.1 },
   xp:    { perDamage:10, levelBase:100, levelExp:1.3 },
   perk:  { rush1First:1.5, rush2WindowAdd:10, rush3Cap:2.4, body1Each:0.05, body2Clarity:0.25,
@@ -487,7 +493,7 @@ function cssId(v){
 
 /* ================= СОСТОЯНИЕ ================= */
 var KEY = "rpgday.v1";
-var VERSION = 2;
+var VERSION = 3;
 var S = null;
 var curWeight = "S";
 var battleTimers = [];
@@ -498,12 +504,13 @@ var deckIndex = 0;
 function blankToday(date, elements, elemAt){
   return {
     date: date,
-    enemy: makeEnemy(date),
+    squad: makeSquad(date),
     hits: [],
     elements: elements || { sleep:false, food:false, move:false, rest:false },
     elemAt:   elemAt   || { sleep:null,  food:null,  move:null,  rest:null },
     comboCount: 0,
     lastHitAt: null,
+    lastKill: null,
     bossWin: null
   };
 }
@@ -594,7 +601,7 @@ function migrate(raw){
     var ea = t.elemAt && typeof t.elemAt === "object" ? t.elemAt : {};
     var nt = {
       date: t.date,
-      enemy: null,
+      squad: null,
       hits: Array.isArray(t.hits) ? t.hits.filter(function(h){ return h && Number.isFinite(Number(h.damage)); })
               .map(function(h){
                 return { id: str(h.id, uid(), 40), title: String(h.title||"Удар").slice(0,80),
@@ -605,6 +612,7 @@ function migrate(raw){
       elements: {}, elemAt: {},
       comboCount: Math.max(0, Math.round(num(Number(t.comboCount)))),
       lastHitAt: (typeof t.lastHitAt === "number" && Number.isFinite(t.lastHitAt) && t.lastHitAt > 0) ? t.lastHitAt : null,
+      lastKill: typeof t.lastKill === "string" && t.lastKill.trim() ? t.lastKill.slice(0, 60) : null,
       bossWin: (t.bossWin && typeof t.bossWin === "object" && typeof t.bossWin.name === "string")
                ? { name: t.bossWin.name, loot: (typeof t.bossWin.loot === "string" ? t.bossWin.loot : null) } : null
     };
@@ -613,18 +621,28 @@ function migrate(raw){
       nt.elemAt[m.k] = (typeof ea[m.k] === "number" && Number.isFinite(ea[m.k]) && ea[m.k] > 0)
         ? ea[m.k] : (nt.elements[m.k] ? nowMs() : null);
     });
-    var e = t.enemy && typeof t.enemy === "object" ? t.enemy : null;
-    if(e && Number.isFinite(Number(e.hpMax))){
-      nt.enemy = {
-        id: str(e.id, uid(), 40),
-        name: typeof e.name === "string" ? e.name : ENEMIES[0],
-        hpMax: Math.max(1, Math.round(num(Number(e.hpMax)) || BALANCE.enemy.hpDefault)),
-        hp: Math.max(0, Math.round(num(Number(e.hp)))),
-        seed: num(Number(e.seed)),
-        dead: e.dead === true
+    function foe(raw, fallback){
+      if(!raw || typeof raw !== "object" || !Number.isFinite(Number(raw.hpMax))) return null;
+      var f = {
+        id: str(raw.id, uid(), 40),
+        name: typeof raw.name === "string" ? raw.name : (fallback || ENEMIES[0]),
+        hpMax: Math.max(1, Math.round(num(Number(raw.hpMax)) || 1)),
+        hp: Math.max(0, Math.round(num(Number(raw.hp)))),
+        dead: raw.dead === true
       };
-      if(nt.enemy.hp > nt.enemy.hpMax) nt.enemy.hp = nt.enemy.hpMax;
-      if(nt.enemy.hp === 0) nt.enemy.dead = true;
+      if(f.hp > f.hpMax) f.hp = f.hpMax;
+      if(f.hp === 0) f.dead = true;
+      return f;
+    }
+    if(Array.isArray(t.squad)){
+      nt.squad = t.squad.map(function(x, i){ return foe(x, ENEMIES[i]); })
+                        .filter(Boolean)
+                        .slice(0, BALANCE.enemy.squad.length);
+    }
+    /* v2 → v3: одиночный враг дня становится первым в отряде, его полоса не теряется. */
+    if((!nt.squad || !nt.squad.length) && t.enemy){
+      var one = foe(t.enemy, ENEMIES[0]);
+      if(one) nt.squad = [one];
     }
     d.today = nt;
   }
@@ -698,37 +716,58 @@ function windowValues(){
   }
   return v;
 }
-/* Опорное число дня. Одно на всё: и враг дня, и босс считаются от него —
+/* Норма дня — единственное опорное число. От него считается и отряд, и босс:
    иначе ломается инвариант «в момент прихода босса накопленной силы уже хватает».
-   null — в окне не было ни одного дня с ударами. */
-function medianDaily(){
+   Абсолютного потолка нет — планка всегда в масштабе твоего дня. */
+function dayNorm(){
+  var N = BALANCE.enemy.norm;
+  /* ТЗ 5.5: пока данных меньше трёх дней — предполагаемая норма. */
+  if(recordedDays() < BALANCE.enemy.medianMinDays) return N.def;
   var v = windowValues();
-  if(!v.length) return null;
-  var m = median(v);
-  if(!Number.isFinite(m)) return null;
-  /* Пока в окне меньше medianMinDays дней с ударами, медиана шаткая: один сильный день
-     подбросил бы планку вчетверо за сутки. Подрезаем до стартового уровня. */
-  if(v.length < BALANCE.enemy.medianMinDays){
-    m = Math.min(m, BALANCE.enemy.hpDefault / BALANCE.enemy.medianFactor);
-  }
-  return m;
-}
-function enemyHpFor(){
-  /* ТЗ 5.5: пока данных меньше трёх дней — стартовые 120. */
-  if(recordedDays() < BALANCE.enemy.medianMinDays) return BALANCE.enemy.hpDefault;
-  var m = medianDaily();
   /* История есть, но в окне пусто: возвращение после паузы — самый лёгкий возможный вход. */
-  if(m === null) return BALANCE.enemy.hpMin;
-  var hp = Math.round(BALANCE.enemy.medianFactor * m);
-  if(!Number.isFinite(hp)) return BALANCE.enemy.hpDefault;
-  return clamp(hp, BALANCE.enemy.hpMin, BALANCE.enemy.hpMax);
+  if(!v.length) return N.back;
+  var m = median(v);
+  if(!Number.isFinite(m) || m <= 0) return N.def;
+  /* Пока в окне меньше medianMinDays дней с ударами, медиана шаткая: один сильный день
+     подбросил бы планку вчетверо за сутки. Подрезаем до стартовой нормы. */
+  if(v.length < BALANCE.enemy.medianMinDays) m = Math.min(m, N.def);
+  return clamp(Math.round(m), N.min, N.max);
 }
-function makeEnemy(date){
+/* Три разных имени на день, выбор по сиду от даты. */
+function pickNames(rnd, count){
+  var pool = ENEMIES.slice(), out = [];
+  for(var i=0;i<count;i++){
+    if(!pool.length) pool = ENEMIES.slice();
+    out.push(pool.splice(Math.floor(rnd()*pool.length), 1)[0]);
+  }
+  return out;
+}
+function makeSquad(date){
+  var norm = dayNorm();
   var seed = hashStr(String(date));
   var rnd = mulberry32(seed);
-  var hp = enemyHpFor();
-  return { id:"e"+seed, name: ENEMIES[Math.floor(rnd()*ENEMIES.length)] || ENEMIES[0],
-           hpMax: hp, hp: hp, seed: seed, dead:false };
+  var names = pickNames(rnd, BALANCE.enemy.squad.length);
+  return BALANCE.enemy.squad.map(function(k, i){
+    var hp = Math.max(1, Math.round(norm * k));
+    return { id:"e" + seed + "-" + i, name: names[i] || ENEMIES[i] || ENEMIES[0],
+             hpMax: hp, hp: hp, dead:false };
+  });
+}
+/* Текущий противник — первый живой в отряде. */
+function curFoe(){
+  if(!S.today || !S.today.squad) return null;
+  for(var i=0;i<S.today.squad.length;i++) if(!S.today.squad[i].dead) return S.today.squad[i];
+  return null;
+}
+function squadPending(){
+  var out = [], seen = false;
+  for(var i=0;i<S.today.squad.length;i++){
+    var f = S.today.squad[i];
+    if(f.dead) continue;
+    if(!seen){ seen = true; continue; }
+    out.push(f.name);
+  }
+  return out;
 }
 function powerWindow(){
   var base = today(), sum = 0;
@@ -792,7 +831,7 @@ function expireBoss(){
 }
 function ensureToday(){
   if(!S.today) S.today = blankToday(today());
-  if(!S.today.enemy) S.today.enemy = makeEnemy(S.today.date);
+  if(!Array.isArray(S.today.squad) || !S.today.squad.length) S.today.squad = makeSquad(S.today.date);
 }
 /* Возвращает true, если сменились сутки: вызывающему нужен полный перерисов. */
 function tickSilent(){
@@ -804,7 +843,7 @@ function tickSilent(){
 }
 function tick(){
   var changed = false;
-  if(!S.today || !S.today.enemy){ ensureToday(); changed = true; }
+  if(!S.today || !Array.isArray(S.today.squad) || !S.today.squad.length){ ensureToday(); changed = true; }
   if(rollDay()) changed = true;
   if(expireBoss()) changed = true;
   if(expireElements()) changed = true;
@@ -820,12 +859,11 @@ function maybeSpawnBoss(){
   if(S.boss || !S.today) return false;
   var last = S.bossState.lastBossDate;
   if(last && daysBetween(last, today()) < BALANCE.boss.cooldownDays) return false;
+  var norm = dayNorm();
   var power = powerWindow();
-  if(power < BALANCE.boss.powerFactor * S.today.enemy.hpMax) return false;
+  if(power < BALANCE.boss.powerFactor * norm) return false;
 
-  var m = medianDaily();
-  if(m === null || !Number.isFinite(m) || m <= 0) m = BALANCE.enemy.hpDefault;
-  var hp = Math.max(1, Math.round(m * S.bossState.difficultyMult));
+  var hp = Math.max(1, Math.round(norm * S.bossState.difficultyMult));
   S.boss = { id:"b"+uid(), name: pick(BOSSES), hpMax: hp, hp: hp,
              expiresAt: nowMs() + bossWindowMs(), tier: S.bossState.difficultyMult };
   S.bossState.lastBossDate = today();
@@ -892,23 +930,33 @@ function strike(title, weight, opts){
   });
   S.dailyDamage[S.today.date] = Math.round(num(Number(S.dailyDamage[S.today.date])) + damage);
 
-  var res = { damage: damage, enemyKilled:false, enemyLoot:null, bossHit:0, bossKilled:false,
+  var res = { damage: damage, killed: [], loot: [], squadDown:false, bossHit:0, bossKilled:false,
               bossLoot:null, bossName:null, levelUp:false, bossCame:false };
   var lvlBefore = S.player.level;
 
-  var e = S.today.enemy;
-  if(e && !e.dead){
-    e.hp = Math.max(0, e.hp - damage);
-    if(e.hp === 0){
-      e.dead = true;
-      res.enemyKilled = true;
-      addXp(Math.round(e.hpMax * BALANCE.enemy.killXpFactor));
+  /* Излишек переносится на следующего: один сильный удар может снять двоих,
+     и ничего не пропадает впустую. */
+  S.today.lastKill = null;
+  var left = damage;
+  for(var si=0; si<S.today.squad.length && left > 0; si++){
+    var f = S.today.squad[si];
+    if(f.dead) continue;
+    var take = Math.min(f.hp, left);
+    f.hp -= take;
+    left -= take;
+    if(f.hp === 0){
+      f.dead = true;
+      res.killed.push(f.name);
+      addXp(Math.round(f.hpMax * BALANCE.enemy.killXpFactor));
       if(Math.random() < lootChance()){
-        res.enemyLoot = pick(LOOT_COMMON);
-        S.player.loot.push(res.enemyLoot);
+        var got = pick(LOOT_COMMON);
+        res.loot.push(got);
+        S.player.loot.push(got);
       }
     }
   }
+  if(res.killed.length) S.today.lastKill = res.killed[res.killed.length - 1];
+  res.squadDown = !curFoe();
   if(S.boss){
     var bd = Math.max(1, Math.round(damage * (1 + bossBonus())));
     res.bossHit = bd;
@@ -1015,16 +1063,25 @@ function renderBossClock(){
   if(el && S.boss) el.textContent = "Окно открыто ещё " + fmtLeft(S.boss.expiresAt - nowMs());
 }
 function renderEnemy(){
-  var e = S.today.enemy;
+  var cur = curFoe();
+  if(!cur){
+    $("c-enemy").innerHTML =
+      '<div class="foe__top"><h2 class="foe__name">Отряд разбит</h2></div>' +
+      hpBar(0, 1, false, true) +
+      '<p class="foe__sub">Удары дальше идут в счёт дня.</p>';
+    return;
+  }
+  var pending = squadPending();
   var sub;
-  if(e.dead) sub = "Удары дальше идут в счёт дня.";
+  if(S.today.lastKill) sub = S.today.lastKill + " повержен. Дальше — следующий.";
   else if(S.today.hits.length === 0) sub = "Ждёт первого удара.";
   else sub = "";
   $("c-enemy").innerHTML =
-    '<div class="foe__top"><h2 class="foe__name">' + esc(e.name) + '</h2>' +
-      '<span class="foe__hp">' + (e.dead ? "повержен" : e.hp) + '</span></div>' +
-    hpBar(e.hp, e.hpMax, false, e.dead) +
-    (sub ? '<p class="foe__sub">' + esc(sub) + '</p>' : '');
+    '<div class="foe__top"><h2 class="foe__name">' + esc(cur.name) + '</h2>' +
+      '<span class="foe__hp">' + cur.hp + '</span></div>' +
+    hpBar(cur.hp, cur.hpMax, false, false) +
+    (sub ? '<p class="foe__sub">' + esc(sub) + '</p>' : '') +
+    (pending.length ? '<p class="foe__rest">За ним: ' + esc(pending.join(", ")) + '</p>' : '');
 }
 function renderElements(){
   var html = '<p class="h">Стихии</p><div class="elems">';
@@ -1593,8 +1650,10 @@ function afterStrike(res, actionId){
   floatDamage(res.damage, false);
   if(res.bossHit && !res.bossKilled) setTimeout(function(){ floatDamage(res.bossHit, true); }, 140);
   var msgs = [];
-  if(res.enemyKilled) msgs.push("Повержен");
-  if(res.enemyLoot) msgs.push("Подобрано: " + LOOT[res.enemyLoot].n);
+  if(res.killed.length === 1) msgs.push("Повержен: " + res.killed[0]);
+  else if(res.killed.length > 1) msgs.push("Повержены: " + res.killed.join(", "));
+  if(res.squadDown && res.killed.length) msgs.push("Отряд разбит");
+  res.loot.forEach(function(id){ msgs.push("Подобрано: " + LOOT[id].n); });
   if(res.bossKilled) msgs.push((res.bossName || "Гость") + " повержен");
   if(res.levelUp) msgs.push("Уровень " + S.player.level);
   if(res.bossCame) msgs.push("Пришёл " + (S.boss ? S.boss.name : "гость"));
@@ -1737,8 +1796,9 @@ function boot(){
                     strike: strike, migrate: migrate, defaults: defaults, BALANCE: BALANCE,
                     threshold: threshold, elementsMult: elementsMult, comboMult: comboMult,
                     activeComboMult: activeComboMult,
-                    powerWindow: powerWindow, medianDaily: medianDaily, enemyHpFor: enemyHpFor,
-                    recordedDays: recordedDays, makeEnemy: makeEnemy, windowValues: windowValues,
+                    powerWindow: powerWindow, dayNorm: dayNorm, curFoe: curFoe,
+                    recordedDays: recordedDays, makeSquad: makeSquad, windowValues: windowValues,
+                    squadPending: squadPending,
                     maybeSpawnBoss: maybeSpawnBoss, blankToday: blankToday, today: today,
                     lootChance: lootChance, bossBonus: bossBonus, comboWindowMs: comboWindowMs,
                     hasPerk: hasPerk, lootAgg: lootAgg, rollDay: rollDay, ensureToday: ensureToday,
